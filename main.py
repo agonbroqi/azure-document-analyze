@@ -9,7 +9,19 @@ import os
 
 load_dotenv()
 
-app = FastAPI()
+app = FastAPI(
+    title="Document Analysis API",
+    description="API for analyzing documents using Azure Document Intelligence"
+)
+
+@app.get("/")
+async def root():
+    return {
+        "message": "Welcome to Document Analysis API",
+        "endpoints": {
+            "analyze": "/analyze/ (POST) - Upload a document for analysis"
+        }
+    }
 
 class DocumentProcessor:
     def __init__(self):
