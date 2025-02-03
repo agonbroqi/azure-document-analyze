@@ -6,14 +6,14 @@ from collections import OrderedDict
 from dotenv import load_dotenv
 import os
 
-# Load environment variables from .env file
+
 load_dotenv()
 
 app = FastAPI()
 
 class DocumentProcessor:
     def __init__(self):
-        # Get credentials from .env file
+       
         self.endpoint = os.getenv("AZURE_ENDPOINT")
         self.key = os.getenv("AZURE_KEY")
         
