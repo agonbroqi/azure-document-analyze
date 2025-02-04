@@ -1,10 +1,11 @@
-from fastapi import FastAPI, File, UploadFile, HTTPException
+from fastapi import FastAPI, File, UploadFile, HTTPException, Form
 from azure.ai.documentintelligence import DocumentIntelligenceClient
 from azure.core.credentials import AzureKeyCredential
 import base64
 from collections import OrderedDict
 from dotenv import load_dotenv
 import os
+from typing import List
 
 
 load_dotenv()
@@ -105,23 +106,171 @@ class DocumentProcessor:
             
             result = poller.result()
 
-            raw_data = {}
+            all_documents = []
             
             if hasattr(result, 'documents') and result.documents:
                 for document in result.documents:
+                    raw_data = {}
                     for name, field in document.fields.items():
                         if field is not None:
                             raw_data[name] = self.clean_value(name, field.content or "")
+                    all_documents.append(self.organize_data(raw_data))
 
+            # If only one document was processed, return it directly
+            if len(all_documents) == 1:
+                return all_documents[0]
             
-            return self.organize_data(raw_data)
+          
+            return {
+                "documents": all_documents,
+                "total_documents": len(all_documents)
+            }
 
         except Exception as e:
             print(f"Error during analysis: {str(e)}")
             raise HTTPException(status_code=500, detail=str(e))
 
+    def are_same_document(self, doc1: dict, doc2: dict) -> bool:
+        # Check all fields that should match
+        identifiers = [
+            # Invoice Information
+            (doc1["analysis"]["invoice_information"]["customer_number"], 
+             doc2["analysis"]["invoice_information"]["customer_number"]),
+            (doc1["analysis"]["invoice_information"]["order_number"], 
+             doc2["analysis"]["invoice_information"]["order_number"]),
+            (doc1["analysis"]["invoice_information"]["date_of_delivery"], 
+             doc2["analysis"]["invoice_information"]["date_of_delivery"]),
+            
+            # Vehicle Information
+            (doc1["analysis"]["vehicle_information"]["uid"], 
+             doc2["analysis"]["vehicle_information"]["uid"]),
+            (doc1["analysis"]["vehicle_information"]["operating_number"], 
+             doc2["analysis"]["vehicle_information"]["operating_number"]),
+            (doc1["analysis"]["vehicle_information"]["official_label"], 
+             doc2["analysis"]["vehicle_information"]["official_label"]),
+            (doc1["analysis"]["vehicle_information"]["type_model"], 
+             doc2["analysis"]["vehicle_information"]["type_model"]),
+            (doc1["analysis"]["vehicle_information"]["first_registration"], 
+             doc2["analysis"]["vehicle_information"]["first_registration"]),
+            (doc1["analysis"]["vehicle_information"]["chassis_number"], 
+             doc2["analysis"]["vehicle_information"]["chassis_number"]),
+            (doc1["analysis"]["vehicle_information"]["installation_date"], 
+             doc2["analysis"]["vehicle_information"]["installation_date"]),
+            (doc1["analysis"]["vehicle_information"]["service_consultant"], 
+             doc2["analysis"]["vehicle_information"]["service_consultant"]),
+            (doc1["analysis"]["vehicle_information"]["km_status"], 
+             doc2["analysis"]["vehicle_information"]["km_status"])
+        ]
+        
+        # Count how many identifiers match
+        matches = sum(1 for id1, id2 in identifiers if id1 and id2 and id1 == id2)
+        
+        # Log the number of matches for debugging
+        print(f"Number of matches: {matches} out of {len(identifiers)}")
+        print("Non-matching fields:")
+        for i, (id1, id2) in enumerate(identifiers):
+            if id1 != id2:
+                print(f"Field {i}: '{id1}' vs '{id2}'")
+        
+        # Return True if at least 5 identifiers match
+        return matches >= 5
+
+    def combine_results(self, results: List[dict]) -> dict:
+     
+        for i in range(len(results)-1):
+            if not self.are_same_document(results[i], results[i+1]):
+                raise HTTPException(
+                    status_code=400,
+                    detail={
+                        "error": "Different documents detected",
+                        "message": "The uploaded files appear to be from different documents. Please upload pages from the same document.",
+                        "files": [r["filename"] for r in results]
+                    }
+                )
+
+       
+        combined = {
+            "company_information": {
+                "company_name": "",
+                "company_address": ""
+            },
+            "invoice_information": {
+                "invoice_number": "",
+                "customer_number": "",
+                "order_number": "",
+                "date_of_delivery": ""
+            },
+            "vehicle_information": {
+                "uid": "",
+                "operating_number": "",
+                "official_label": "",
+                "type_model": "",
+                "first_registration": "",
+                "chassis_number": "",
+                "installation_date": "",
+                "service_consultant": "",
+                "km_status": ""
+            },
+            "financial_information": OrderedDict([
+                ("work_price", ""),
+                ("material_price", ""),
+                ("tax_basis", ""),
+                ("vat_percentage", ""),
+                ("vat_total", ""),
+                ("total_amount", "")
+            ])
+        }
+
+        for result in results:
+            for section in combined:
+                for field in combined[section]:
+                    if not combined[section][field] and result["analysis"][section][field]:
+                        combined[section][field] = result["analysis"][section][field]
+
+        return combined
+
 @app.post("/analyze/")
-async def analyze_file(file: UploadFile = File(...)):
-    processor = DocumentProcessor()
-    content = await file.read()
-    return await processor.analyze_document(content)
+async def analyze_files(
+    file: UploadFile = File(None),
+    files: List[UploadFile] = File(None)
+):
+    try:
+        processor = DocumentProcessor()
+        results = []
+        
+      
+        if file and not files:
+            content = await file.read()
+            result = await processor.analyze_document(content)
+            results.append({
+                "filename": file.filename,
+                "analysis": result
+            })
+        
+    
+        elif files and not file:
+            for f in files:
+                content = await f.read()
+                result = await processor.analyze_document(content)
+                results.append({
+                    "filename": f.filename,
+                    "analysis": result
+                })
+        else:
+            raise HTTPException(status_code=400, detail="Please provide either 'file' or 'files'")
+        
+       
+        if len(results) > 1:
+            combined_result = processor.combine_results(results)
+            return {
+                "combined_analysis": combined_result,
+                "original_files": [r["filename"] for r in results]
+            }
+        else:
+         
+            return results[0]
+            
+    except HTTPException as he:
+        raise he
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
