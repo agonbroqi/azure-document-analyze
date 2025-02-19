@@ -90,45 +90,53 @@ class DocumentProcessor:
 
     async def analyze_document(self, file_content: bytes):
         try:
-            
             base64_content = base64.b64encode(file_content).decode()
-            
             
             body = {
                 "base64Source": base64_content
             }
             
-            # Send request with body
             poller = self.client.begin_analyze_document(
                 model_id="final",
                 body=body
             )
             
             result = poller.result()
-
-            all_documents = []
             
             if hasattr(result, 'documents') and result.documents:
                 for document in result.documents:
-                    raw_data = {}
-                    for name, field in document.fields.items():
-                        if field is not None:
-                            raw_data[name] = self.clean_value(name, field.content or "")
-                    all_documents.append(self.organize_data(raw_data))
-
-            # If only one document was processed, return it directly
-            if len(all_documents) == 1:
-                return all_documents[0]
+                    fields = document.fields
+                    
+                    # Extract invoice information
+                    invoice_info = {
+                        "customer_number": fields.get("customer_number", {}).content if fields.get("customer_number") else "",
+                        "order_number": fields.get("order_number", {}).content if fields.get("order_number") else "",
+                        "date_of_delivery": fields.get("date_of_delivery", {}).content if fields.get("date_of_delivery") else ""
+                    }
+                    
+                    # Extract vehicle information
+                    vehicle_info = {
+                        "uid": fields.get("uid", {}).content if fields.get("uid") else "",
+                        "operating_number": fields.get("operating_number", {}).content if fields.get("operating_number") else "",
+                        "official_label": fields.get("official_label", {}).content if fields.get("official_label") else "",
+                        "type_model": fields.get("type_model", {}).content if fields.get("type_model") else "",
+                        "first_registration": fields.get("first_registration", {}).content if fields.get("first_registration") else "",
+                        "chassis_number": fields.get("chassis_number", {}).content if fields.get("chassis_number") else "",
+                        "installation_date": fields.get("installation_date", {}).content if fields.get("installation_date") else "",
+                        "service_consultant": fields.get("service_consultant", {}).content if fields.get("service_consultant") else "",
+                        "km_status": fields.get("km_status", {}).content if fields.get("km_status") else ""
+                    }
+                    
+                    return {
+                        "invoice_information": invoice_info,
+                        "vehicle_information": vehicle_info
+                    }
             
-          
-            return {
-                "documents": all_documents,
-                "total_documents": len(all_documents)
-            }
-
+            raise ValueError("No document information found")
+            
         except Exception as e:
-            print(f"Error during analysis: {str(e)}")
-            raise HTTPException(status_code=500, detail=str(e))
+            print(f"Error during document analysis: {str(e)}")
+            raise
 
     def are_same_document(self, doc1: dict, doc2: dict) -> bool:
         # Check all fields that should match
@@ -238,39 +246,172 @@ async def analyze_files(
         processor = DocumentProcessor()
         results = []
         
-      
+        # Handle single file
         if file and not files:
             content = await file.read()
-            result = await processor.analyze_document(content)
+            analysis = await processor.analyze_document(content)
             results.append({
                 "filename": file.filename,
-                "analysis": result
+                "analysis": analysis
             })
         
-    
+        # Handle multiple files
         elif files and not file:
             for f in files:
                 content = await f.read()
-                result = await processor.analyze_document(content)
+                analysis = await processor.analyze_document(content)
                 results.append({
                     "filename": f.filename,
-                    "analysis": result
+                    "analysis": analysis
                 })
         else:
             raise HTTPException(status_code=400, detail="Please provide either 'file' or 'files'")
         
-       
+        # Return results
         if len(results) > 1:
-            combined_result = processor.combine_results(results)
+            # Verify documents are from the same vehicle/order
+            for i in range(1, len(results)):
+                if not processor.are_same_document(results[0], results[i]):
+                    raise HTTPException(
+                        status_code=400,
+                        detail={
+                            "error": "Different documents detected",
+                            "message": "The uploaded files appear to be from different vehicles or orders. Please upload documents for the same vehicle/order.",
+                            "files": [r["filename"] for r in results]
+                        }
+                    )
+            
+            # Combine the results
+            combined = {
+                "invoice_information": results[0]["analysis"]["invoice_information"],
+                "vehicle_information": results[0]["analysis"]["vehicle_information"]
+            }
+            
+            # Update with non-empty values from other results
+            for result in results[1:]:
+                for section in ["invoice_information", "vehicle_information"]:
+                    for field, value in result["analysis"][section].items():
+                        if value and not combined[section][field]:
+                            combined[section][field] = value
+            
             return {
-                "combined_analysis": combined_result,
+                "combined_analysis": combined,
                 "original_files": [r["filename"] for r in results]
             }
         else:
-         
+            # Return single result directly
             return results[0]
             
-    except HTTPException as he:
-        raise he
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.post("/analyze-license/")
+async def analyze_license(
+    file: UploadFile = File(None),
+    files: List[UploadFile] = File(None)
+):
+    try:
+        processor = DocumentProcessor()
+        results = []
+        
+        # Handle single file
+        if file and not files:
+            content = await file.read()
+            base64_content = base64.b64encode(content).decode()
+            
+            poller = processor.client.begin_analyze_document(
+                model_id="license",
+                body={"base64Source": base64_content}
+            )
+            
+            result = poller.result()
+            
+            if hasattr(result, 'documents') and result.documents:
+                for document in result.documents:
+                    fields = document.fields
+                    license_data = {
+                        "marke": fields.get("marke", "").content if fields.get("marke") else "",
+                        "model": fields.get("model", "").content if fields.get("model") else "",
+                        "typ": fields.get("type/variant/version", "").content if fields.get("type/variant/version") else "",
+                        "fin": fields.get("fin", "").content if fields.get("fin") else "",
+                        "erstzulassung": fields.get("erstzulassung", "").content if fields.get("erstzulassung") else "",
+                        "letzte_wartung": fields.get("letze wartung", "").content if fields.get("letze wartung") else ""
+                    }
+                    results.append({
+                        "filename": file.filename,
+                        "analysis": license_data
+                    })
+        
+        # Handle multiple files
+        elif files and not file:
+            for f in files:
+                content = await f.read()
+                base64_content = base64.b64encode(content).decode()
+                
+                poller = processor.client.begin_analyze_document(
+                    model_id="license",
+                    body={"base64Source": base64_content}
+                )
+                
+                result = poller.result()
+                
+                if hasattr(result, 'documents') and result.documents:
+                    for document in result.documents:
+                        fields = document.fields
+                        license_data = {
+                            "marke": fields.get("marke", "").content if fields.get("marke") else "",
+                            "model": fields.get("model", "").content if fields.get("model") else "",
+                            "typ": fields.get("type/variant/version", "").content if fields.get("type/variant/version") else "",
+                            "fin": fields.get("fin", "").content if fields.get("fin") else "",
+                            "erstzulassung": fields.get("erstzulassung", "").content if fields.get("erstzulassung") else "",
+                            "letzte_wartung": fields.get("letze wartung", "").content if fields.get("letze wartung") else ""
+                        }
+                        results.append({
+                            "filename": f.filename,
+                            "analysis": license_data
+                        })
+        else:
+            raise HTTPException(status_code=400, detail="Please provide either 'file' or 'files'")
+        
+        # Return results
+        if len(results) > 1:
+            # Verify documents are from the same vehicle
+            for i in range(1, len(results)):
+                # Check if key fields match
+                if (results[0]["analysis"]["fin"] != results[i]["analysis"]["fin"] or
+                    results[0]["analysis"]["marke"] != results[i]["analysis"]["marke"] or
+                    results[0]["analysis"]["model"] != results[i]["analysis"]["model"]):
+                    raise HTTPException(
+                        status_code=400,
+                        detail={
+                            "error": "Different vehicles detected",
+                            "message": "The uploaded files appear to be from different vehicles. Please upload documents for the same vehicle.",
+                            "files": [r["filename"] for r in results]
+                        }
+                    )
+            
+            # Combine the results, taking non-empty values
+            combined = {
+                "marke": "",
+                "model": "",
+                "typ": "",
+                "fin": "",
+                "erstzulassung": "",
+                "letzte_wartung": ""
+            }
+            
+            for result in results:
+                for field in combined:
+                    if not combined[field] and result["analysis"][field]:
+                        combined[field] = result["analysis"][field]
+            
+            return {
+                "combined_analysis": combined,
+                "original_files": [r["filename"] for r in results]
+            }
+        else:
+            # Return single result directly
+            return results[0]
+            
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
