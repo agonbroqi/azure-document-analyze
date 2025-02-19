@@ -6,6 +6,7 @@ from collections import OrderedDict
 from dotenv import load_dotenv
 import os
 from typing import List
+import re
 
 
 load_dotenv()
@@ -29,7 +30,9 @@ class DocumentProcessor:
         """Clean and format field values."""
         if not value:
             return ""
-        return str(value).strip()
+        # Remove newlines and duplicates
+        cleaned = re.sub(r'(\d+,\d+)\n\1', r'\1', str(value))
+        return cleaned.strip()
 
     def organize_data(self, raw_data: dict) -> dict:
         """Organize raw data into structured format."""
@@ -47,12 +50,12 @@ class DocumentProcessor:
                 "km_status": raw_data.get("km-status", "")
             },
             "financial_information": OrderedDict([
-                ("work_price", raw_data.get("work price total", "")),
-                ("material_price", raw_data.get("material price total", "")),
-                ("tax_basis", raw_data.get("tax basis", "")),
+                ("work_price", self.clean_value("work price", raw_data.get("work price total", ""))),
+                ("material_price", self.clean_value("material price", raw_data.get("material price total", ""))),
+                ("tax_basis", self.clean_value("tax basis", raw_data.get("tax basis", ""))),
                 ("vat_percentage", raw_data.get("VAT percentage", "")),
-                ("vat_total", raw_data.get("VAT total", "")),
-                ("total_amount", raw_data.get("total amount", ""))
+                ("vat_total", self.clean_value("vat total", raw_data.get("VAT total", ""))),
+                ("total_amount", self.clean_value("total amount", raw_data.get("total amount", "")))
             ])
         }
 
@@ -61,7 +64,7 @@ class DocumentProcessor:
             base64_content = base64.b64encode(file_content).decode()
             
             poller = self.client.begin_analyze_document(
-                model_id="final",  # Just the model name
+                model_id="final",
                 body={"base64Source": base64_content}
             )
             
@@ -79,15 +82,15 @@ class DocumentProcessor:
             raise ValueError("No document information found")
             
         except Exception as e:
-            print(f"Error in analyze_document: {str(e)}")  # More detailed error logging
-            print(f"Endpoint: {self.endpoint}")  # Log endpoint
-            print(f"Model ID: final")  # Log model ID
+            print(f"Error in analyze_document: {str(e)}") 
+            print(f"Endpoint: {self.endpoint}")  
+            print(f"Model ID: final")  
             raise HTTPException(status_code=500, detail=str(e))
 
     def are_same_document(self, doc1: dict, doc2: dict) -> bool:
-        # Check all fields that should match
+        
         identifiers = [
-            # Invoice Information
+            
             (doc1["analysis"]["invoice_information"]["costumer_number"], 
              doc2["analysis"]["invoice_information"]["costumer_number"]),
             (doc1["analysis"]["invoice_information"]["order_number"], 
@@ -95,7 +98,7 @@ class DocumentProcessor:
             (doc1["analysis"]["invoice_information"]["date_of_delivery"], 
              doc2["analysis"]["invoice_information"]["date_of_delivery"]),
             
-            # Vehicle Information
+            
             (doc1["analysis"]["vehicle_information"]["operating_number"], 
              doc2["analysis"]["vehicle_information"]["operating_number"]),
             (doc1["analysis"]["vehicle_information"]["first_registration"], 
@@ -106,21 +109,21 @@ class DocumentProcessor:
              doc2["analysis"]["vehicle_information"]["km_status"])
         ]
         
-        # Count how many identifiers match
+        
         matches = sum(1 for id1, id2 in identifiers if id1 and id2 and id1 == id2)
         
-        # Log the number of matches for debugging
+        
         print(f"Number of matches: {matches} out of {len(identifiers)}")
         print("Non-matching fields:")
         for i, (id1, id2) in enumerate(identifiers):
             if id1 != id2:
                 print(f"Field {i}: '{id1}' vs '{id2}'")
         
-        # Return True if at least 3 identifiers match
+        
         return matches >= 3
 
     def combine_results(self, results: List[dict]) -> dict:
-        # Verify all documents are from the same source
+        
         for i in range(len(results)-1):
             if not self.are_same_document(results[i], results[i+1]):
                 raise HTTPException(
@@ -132,7 +135,7 @@ class DocumentProcessor:
                     }
                 )
 
-        # Initialize combined result with empty values
+        
         combined = {
             "invoice_information": {
                 "invoice_number": "",
@@ -156,7 +159,7 @@ class DocumentProcessor:
             ])
         }
 
-        # Update with non-empty values from all results
+        
         for result in results:
             for section in combined:
                 for field in combined[section]:
@@ -170,7 +173,7 @@ class DocumentProcessor:
             base64_content = base64.b64encode(file_content).decode()
             
             poller = self.client.begin_analyze_document(
-                model_id="license",  # Use license model
+                model_id="license",  
                 body={"base64Source": base64_content}
             )
             
@@ -217,7 +220,7 @@ class DocumentProcessor:
         if v1.get("marke") and v2.get("marke") and v1["marke"] == v2["marke"]:
             matches += 1
         
-        # Return True if at least 2 identifiers match
+        
         return matches >= 2
 
     def combine_license_results(self, results: List[dict]) -> dict:
@@ -232,7 +235,7 @@ class DocumentProcessor:
             }
         }
 
-        # Update with non-empty values from all results
+        
         for result in results:
             for field in combined["vehicle_information"]:
                 if not combined["vehicle_information"][field] and result["analysis"]["vehicle_information"][field]:
@@ -248,7 +251,7 @@ async def analyze_files(
         processor = DocumentProcessor()
         results = []
         
-        # Validate file types
+        
         for f in files:
             if not f.filename.lower().endswith(('.pdf', '.jpg', '.jpeg')):
                 raise HTTPException(
@@ -256,7 +259,7 @@ async def analyze_files(
                     detail=f"File {f.filename} is not a PDF or JPG/JPEG file"
                 )
         
-        # Process all files
+        
         for f in files:
             content = await f.read()
             result = await processor.analyze_document(content)
@@ -265,9 +268,9 @@ async def analyze_files(
                 "analysis": result
             })
             
-        # If we have multiple files, verify they're from the same document
+        
         if len(results) > 1:
-            # Compare each file with the next one
+            
             for i in range(len(results)-1):
                 if not processor.are_same_document(results[i], results[i+1]):
                     return {
@@ -282,7 +285,7 @@ async def analyze_files(
                         }
                     }
             
-            # If all files match, combine their results
+            
             combined_result = processor.combine_results(results)
             return {
                 "status": "success",
@@ -291,10 +294,9 @@ async def analyze_files(
                 "original_files": [r["filename"] for r in results]
             }
         else:
-            # Single file case
+            
             return {
                 "status": "success",
-                "message": "Single file processed",
                 "analysis": results[0]["analysis"],
                 "filename": results[0]["filename"]
             }
@@ -316,19 +318,19 @@ async def analyze_license(
         if not files:
             raise HTTPException(status_code=400, detail="No files provided")
             
-        # Process all files with license model
+        
         for f in files:
             content = await f.read()
-            # Use license model instead of final
+        
             result = await processor.analyze_license_document(content)
             results.append({
                 "filename": f.filename,
                 "analysis": result
             })
             
-        # If we have multiple files, verify they're from the same vehicle
+        
         if len(results) > 1:
-            # Compare each file with the next one
+            
             for i in range(len(results)-1):
                 if not processor.are_same_vehicle(results[i], results[i+1]):
                     return {
@@ -343,7 +345,7 @@ async def analyze_license(
                         }
                     }
             
-            # If all files match, combine their results
+            
             combined_result = processor.combine_license_results(results)
             return {
                 "status": "success",
@@ -352,10 +354,9 @@ async def analyze_license(
                 "original_files": [r["filename"] for r in results]
             }
         else:
-            # Single file case
+            
             return {
                 "status": "success",
-                "message": "Single file processed",
                 "analysis": results[0]["analysis"],
                 "filename": results[0]["filename"]
             }
