@@ -7,6 +7,8 @@ from dotenv import load_dotenv
 import os
 from typing import List
 import re
+import tempfile
+from azure.ai.documentintelligence import DocumentIntelligenceClient
 
 
 load_dotenv()
@@ -30,7 +32,7 @@ class DocumentProcessor:
         """Clean and format field values."""
         if not value:
             return ""
-        # Remove newlines and duplicates
+       
         cleaned = re.sub(r'(\d+,\d+)\n\1', r'\1', str(value))
         return cleaned.strip()
 
@@ -211,7 +213,7 @@ class DocumentProcessor:
         v1 = doc1["analysis"]["vehicle_information"]
         v2 = doc2["analysis"]["vehicle_information"]
         
-        # Count matching fields
+        
         matches = 0
         if v1.get("fin") and v2.get("fin") and v1["fin"] == v2["fin"]:
             matches += 1
@@ -244,125 +246,278 @@ class DocumentProcessor:
         return combined
 
 @app.post("/analyze/")
-async def analyze_files(
-    files: List[UploadFile] = File(...)
-):
+async def analyze_files(files: List[UploadFile] = File(...)):
     try:
-        processor = DocumentProcessor()
-        results = []
-        
-        
-        for f in files:
-            if not f.filename.lower().endswith(('.pdf', '.jpg', '.jpeg')):
-                raise HTTPException(
-                    status_code=400,
-                    detail=f"File {f.filename} is not a PDF or JPG/JPEG file"
-                )
-        
-        
-        for f in files:
-            content = await f.read()
-            result = await processor.analyze_document(content)
-            results.append({
-                "filename": f.filename,
-                "analysis": result
-            })
-            
-        
-        if len(results) > 1:
-            
-            for i in range(len(results)-1):
-                if not processor.are_same_document(results[i], results[i+1]):
-                    return {
-                        "error": "Different documents detected",
-                        "message": "The uploaded files appear to be from different documents.",
-                        "details": {
-                            "files": [r["filename"] for r in results],
-                            "mismatched_files": [
-                                results[i]["filename"],
-                                results[i+1]["filename"]
-                            ]
-                        }
-                    }
-            
-            
-            combined_result = processor.combine_results(results)
-            return {
-                "status": "success",
-                "message": "Combined documents",
-                "combined_analysis": combined_result,
-                "original_files": [r["filename"] for r in results]
-            }
-        else:
-            
-            return {
-                "status": "success",
-                "analysis": results[0]["analysis"],
-                "filename": results[0]["filename"]
-            }
-            
-    except HTTPException as he:
-        raise he
-    except Exception as e:
-        print(f"Error processing files: {str(e)}")
-        raise HTTPException(status_code=500, detail=str(e))
-
-@app.post("/analyze-license/")
-async def analyze_license(
-    files: List[UploadFile] = File(default=[])
-):
-    try:
-        processor = DocumentProcessor()
-        results = []
-        
         if not files:
             raise HTTPException(status_code=400, detail="No files provided")
-            
         
-        for f in files:
-            content = await f.read()
+        # If only one file, process it normally
+        if len(files) == 1:
+            return await process_single_file(files[0])
         
-            result = await processor.analyze_license_document(content)
-            results.append({
-                "filename": f.filename,
-                "analysis": result
-            })
-            
+        # For multiple files, we need to validate they're the same document
+        # and combine their information
+        all_analyses = []
+        filenames = []
         
-        if len(results) > 1:
+        # Process each file individually
+        for file in files:
+            analysis = await process_single_file(file, return_raw=True)
+            all_analyses.append(analysis)
+            filenames.append(file.filename)
+        
+        # Validation fields to check if documents are the same
+        validation_fields = [
+            ("invoice_information", "invoice number"),
+            ("invoice_information", "costumer number"),
+            ("invoice_information", "order number"),
+            ("vehicle_information", "operating number"),
+            ("invoice_information", "unit/chassis number")
+        ]
+        
+        # Check if all documents have the same key identifiers
+        document_identifiers = {}
+        
+        # Extract identifiers from each document
+        for i, analysis in enumerate(all_analyses):
+            doc_id = {}
+            for category, field in validation_fields:
+                if category in analysis["analysis"] and field in analysis["analysis"][category]:
+                    value = analysis["analysis"][category][field]
+                    doc_id[f"{category}.{field}"] = value
             
-            for i in range(len(results)-1):
-                if not processor.are_same_vehicle(results[i], results[i+1]):
-                    return {
-                        "error": "Different vehicles detected",
-                        "message": "The uploaded files appear to be from different vehicles.",
-                        "details": {
-                            "files": [r["filename"] for r in results],
-                            "mismatched_files": [
-                                results[i]["filename"],
-                                results[i+1]["filename"]
-                            ]
-                        }
-                    }
+            document_identifiers[i] = doc_id
+        
+        # Compare identifiers across documents
+        mismatch_fields = []
+        for field_key in set().union(*[set(doc.keys()) for doc in document_identifiers.values()]):
+            values = set()
+            for doc_id in document_identifiers.values():
+                if field_key in doc_id:
+                    values.add(doc_id[field_key])
             
-            
-            combined_result = processor.combine_license_results(results)
+            if len(values) > 1:
+                mismatch_fields.append((field_key, values))
+        
+        # If we found mismatches, return an error
+        if mismatch_fields:
             return {
-                "status": "success",
-                "message": "Combined documents",
-                "combined_analysis": combined_result,
-                "original_files": [r["filename"] for r in results]
+                "status": "error",
+                "message": "The uploaded files appear to be from different invoices",
+                "mismatches": [
+                    {
+                        "field": field,
+                        "values": list(values)
+                    } for field, values in mismatch_fields
+                ],
+                "filenames": filenames
             }
-        else:
-            
-            return {
-                "status": "success",
-                "analysis": results[0]["analysis"],
-                "filename": results[0]["filename"]
-            }
-            
-    except HTTPException as he:
-        raise he
+        
+        # If we get here, the documents are the same - combine their information
+        combined_analysis = {
+            "invoice_information": {},
+            "vehicle_information": {},
+            "financial_information": {}
+        }
+        
+        # Combine all fields from all documents
+        for analysis in all_analyses:
+            for category in combined_analysis.keys():
+                if category in analysis["analysis"]:
+                    for field, value in analysis["analysis"][category].items():
+                        # Only add if not already present or if the new value has more information
+                        if field not in combined_analysis[category] or len(str(value)) > len(str(combined_analysis[category][field])):
+                            combined_analysis[category][field] = value
+        
+        return {
+            "status": "success",
+            "analysis": combined_analysis,
+            "filenames": filenames
+        }
+    
     except Exception as e:
-        print(f"Error processing files: {str(e)}")
-        raise HTTPException(status_code=500, detail=str(e))
+        # Print detailed error for debugging
+        import traceback
+        print(f"Error: {str(e)}")
+        print(traceback.format_exc())
+        raise HTTPException(status_code=500, detail=f"Error processing document: {str(e)}")
+
+# Helper function to process a single file
+async def process_single_file(file, return_raw=False):
+    file_content = await file.read()
+    
+    # Create the Document Intelligence client
+    document_intelligence_client = DocumentIntelligenceClient(
+        endpoint=os.environ["AZURE_ENDPOINT"],
+        credential=AzureKeyCredential(os.environ["AZURE_KEY"])
+    )
+    
+    # Analyze the document using your custom model "final"
+    poller = document_intelligence_client.begin_analyze_document(
+        "final",        # Your custom model name
+        file_content    # document content as bytes
+    )
+    result = poller.result()
+    
+    # Extract fields from the document
+    fields = result.documents[0].fields if result.documents else {}
+    
+    # Initialize our data structures
+    invoice_information = {}
+    vehicle_information = {}
+    financial_information = {}
+    
+    # Clean financial values function
+    def clean_financial_value(value):
+        if not value:
+            return value
+            
+        # Convert to string if it's not already
+        value_str = str(value).strip()
+        
+        # If there are newlines, take only the first value
+        if '\n' in value_str:
+            return value_str.split('\n')[0].strip()
+            
+        return value_str
+    
+    # Process each field from the custom model
+    for field_name, field_content in fields.items():
+        field_value = ""
+        if hasattr(field_content, 'content') and field_content.content:
+            field_value = field_content.content
+        elif hasattr(field_content, 'value') and field_content.value:
+            field_value = field_content.value
+        
+        # Skip empty fields
+        if not field_value:
+            continue
+            
+        # Clean financial values
+        if any(financial_term in field_name.lower() for financial_term in 
+              ["price", "amount", "total", "vat", "tax", "sum"]):
+            field_value = clean_financial_value(field_value)
+        
+        # Assign to the appropriate category
+        if any(invoice_term in field_name.lower() for invoice_term in 
+              ["invoice", "costumer", "order", "date", "registration", "chassis", "recording", "delivery"]):
+            invoice_information[field_name] = field_value
+        elif any(vehicle_term in field_name.lower() for vehicle_term in 
+                ["km", "status", "vehicle", "car", "operating"]):
+            vehicle_information[field_name] = field_value
+        elif any(financial_term in field_name.lower() for financial_term in 
+                ["price", "amount", "total", "vat", "tax", "sum"]):
+            financial_information[field_name] = field_value
+    
+    # Move operating number to vehicle information if it's in invoice information
+    if "operating number" in invoice_information:
+        vehicle_information["operating number"] = invoice_information.pop("operating number")
+    
+    analysis_result = {
+        "status": "success",
+        "analysis": {
+            "invoice_information": invoice_information,
+            "vehicle_information": vehicle_information,
+            "financial_information": financial_information
+        },
+        "filename": file.filename
+    }
+    
+    if return_raw:
+        return analysis_result
+    else:
+        return analysis_result
+
+@app.post("/analyze-license/")
+async def analyze_license(files: List[UploadFile] = File(...)):
+    try:
+        if not files:
+            raise HTTPException(status_code=400, detail="No files provided")
+        
+        # Process all files
+        combined_license_data = {}
+        document_identifiers = set()
+        license_plates = set()
+        fin_numbers = set()
+        
+        for file_index, file in enumerate(files):
+            # Read file content
+            file_content = await file.read()
+            
+            # Create the Document Intelligence client
+            document_intelligence_client = DocumentIntelligenceClient(
+                endpoint=os.environ["AZURE_ENDPOINT"],
+                credential=AzureKeyCredential(os.environ["AZURE_KEY"])
+            )
+            
+            # Analyze the document using your custom model "full-license"
+            poller = document_intelligence_client.begin_analyze_document(
+                "full-license",  # model ID
+                file_content,    # document content as bytes
+            )
+            result = poller.result()
+            
+            # Check if we have documents in the result
+            if not result.documents:
+                raise HTTPException(
+                    status_code=400, 
+                    detail=f"File {file_index + 1} ({file.filename}) could not be analyzed as a license document"
+                )
+            
+            # Extract document identifiers
+            fields = result.documents[0].fields
+            
+            # Check license plate
+            license_plate = None
+            if "A: Licence plate" in fields:
+                field = fields["A: Licence plate"]
+                if hasattr(field, 'content') and field.content:
+                    license_plate = field.content
+                    license_plates.add(license_plate)
+            
+            # Check FIN/VIN
+            fin = None
+            if "E: FIN" in fields:
+                field = fields["E: FIN"]
+                if hasattr(field, 'content') and field.content:
+                    fin = field.content
+                    fin_numbers.add(fin)
+            
+            # Create a document identifier
+            doc_identifier = f"Doc-{file_index}"
+            if license_plate:
+                doc_identifier = f"License:{license_plate}"
+            elif fin:
+                doc_identifier = f"FIN:{fin}"
+            
+            document_identifiers.add(doc_identifier)
+            
+            # Process each field
+            for field_name, field_content in fields.items():
+                # Check if the field has content
+                if hasattr(field_content, 'content') and field_content.content:
+                    # Only add if not already present or if the new value has more information
+                    if field_name not in combined_license_data or len(field_content.content) > len(combined_license_data[field_name]):
+                        combined_license_data[field_name] = field_content.content
+                # Check if the field has a value property
+                elif hasattr(field_content, 'value') and field_content.value:
+                    if field_name not in combined_license_data or len(str(field_content.value)) > len(str(combined_license_data[field_name])):
+                        combined_license_data[field_name] = field_content.value
+        
+        # Validate that all documents are the same
+        if len(license_plates) > 1 or len(fin_numbers) > 1:
+            return {
+                "error": "The uploaded files appear to be from different vehicles.",
+                "license_plates": list(license_plates),
+                "fin_numbers": list(fin_numbers)
+            }
+        
+        # Return the combined results
+        return {"license_data": combined_license_data}
+    
+    except Exception as e:
+        # Print detailed error for debugging
+        import traceback
+        print(f"Error: {str(e)}")
+        print(traceback.format_exc())
+        raise HTTPException(status_code=500, detail=f"Error processing document: {str(e)}")
